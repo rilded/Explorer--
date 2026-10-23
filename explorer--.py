@@ -1634,20 +1634,23 @@ class FileJob(threading.Thread):
                 return False
 
     def _on_delete_error(self, path, e, is_dir):
-        """Решаем по НАСТОЯЩЕЙ ошибке ОС: процесс ищем только если файл занят
-        (32/33) либо это запущенный exe/dll (Windows отвечает "отказано")."""
+        """Ищем держащий файл процесс ТОЛЬКО при реальной занятости —
+        ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION (коды 32/33).
+        Любая другая ошибка (отказ доступа, read-only, атрибуты, права,
+        путь и т.п.) показывается как есть, без поиска процессов."""
         st = self.state
         kind = classify_delete_error(e)
-        failed = getattr(e, "filename", None) or path
         note = ""
-        if self._proc_tries.get(path, 0) == 0 and (
-                kind == "busy" or (kind == "denied" and is_exec_path(failed))):
+        
+        # Поиск процесса запускается СТРОГО только если файл занят (busy).
+        # Никаких проверок на расширение .exe больше нет.
+        if self._proc_tries.get(path, 0) == 0 and kind == "busy":
             self._proc_tries[path] = 1
-            quick = kind != "busy"
             st.current = "Поиск процесса: " + os.path.basename(path)
-            action, note = self._find_and_kill(path, is_dir, quick, kind)
+            action, note = self._find_and_kill(path, is_dir, False, kind)
             if action == "retry":
                 return "retry"
+                
         text = describe_os_error(e)
         if note:
             text = note + "\n\n" + text
@@ -2190,9 +2193,16 @@ class SearchDialog(tk.Toplevel):
         if not sel:
             return
         p = sel[0]
-        target = os.path.dirname(p) if os.path.isfile(p) else p
-        if os.path.isdir(target):
-            self.explorer.navigate_to(target)
+        if os.path.isdir(p):
+            self.explorer.navigate_to(p)
+            return
+        target = os.path.dirname(p)
+        if not os.path.isdir(target):
+            return
+        panel = self.explorer.active_panel
+        if panel is not None:
+            panel.select_after([p])
+        self.explorer.navigate_to(target)
 
     def _copy_paths(self):
         sel = self._selected()
@@ -2211,7 +2221,7 @@ class SearchDialog(tk.Toplevel):
                     activeforeground=DARK["select_fg"])
         if sel:
             m.add_command(label="Открыть", command=self._open_selected)
-            m.add_command(label="Открыть папку в проводнике",
+            m.add_command(label="Открыть в проводнике",
                           command=self._open_folder)
             if any(is_archive(p) for p in sel):
                 m.add_command(label="Открыть архив",
@@ -3595,9 +3605,10 @@ class FilePanel:
 # Главное окно
 # ===========================================================================
 class ExplorerWindow:
-    def __init__(self, root, settings):
+    def __init__(self, root, settings, initial_select=None):
         self.root = root
         self.settings = settings
+        self._initial_select = initial_select  # файл, который нужно выделить при старте
         self.show_hidden = settings.get("show_hidden", True)
         self.address_history = settings.get("address_history", [])
         self.bookmarks = settings.get("bookmarks", [])
@@ -3655,6 +3666,9 @@ class ExplorerWindow:
         home = os.path.expanduser("~")
         d1 = (cfg[0].get("dir") if cfg and isinstance(cfg[0], dict) else None) \
             or settings.get("last_dir") or home
+        if self._initial_select:
+            for p in self.panels:
+                p.select_after([self._initial_select])
         self.navigate_to(d1)
         if self.dual.get():
             d2 = (cfg[1].get("dir") if len(cfg) > 1 and isinstance(cfg[1], dict) else None) or d1
@@ -4879,6 +4893,40 @@ def run_selfcheck():
     return 0
 
 
+def parse_start_path(argv):
+    """--path <папка-или-файл> или просто `explorer-- <путь>` (без флага) —
+    куда открыться при старте; используется, в частности, при запуске из
+    другой программы (например, DedHelper). Путь к папке — открывается в
+    ней; путь к файлу — открывается папка, содержащая файл, а сам файл
+    выделяется и прокручивается в видимую область (например, чтобы показать
+    "расположение" конкретного файла, а не просто открыть диск)."""
+    args = argv[1:]
+    for i, a in enumerate(args):
+        if a == "--path" and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--path="):
+            return a.split("=", 1)[1]
+    for a in args:
+        if not a.startswith("-") and os.path.exists(a):
+            return a
+    return None
+
+
+def resolve_start_target(path):
+    """path (папка или файл) -> (папка_для_открытия, файл_для_выделения|None)."""
+    if not path:
+        return None, None
+    try:
+        if os.path.isfile(path):
+            folder = os.path.dirname(os.path.abspath(path))
+            return (folder if os.path.isdir(folder) else None), os.path.abspath(path)
+        if os.path.isdir(path):
+            return path, None
+    except OSError:
+        pass
+    return None, None
+
+
 def main():
     if "--check" in sys.argv:
         sys.exit(run_selfcheck())
@@ -4889,7 +4937,13 @@ def main():
     if relaunch_as_admin():
         sys.exit(0)
     settings = load_settings()
-    ExplorerWindow(root, settings)
+    start_path = parse_start_path(sys.argv)
+    start_dir, start_file = resolve_start_target(start_path)
+    if start_dir:
+        # явно запрошенный путь важнее запомненного состояния панелей
+        settings["last_dir"] = start_dir
+        settings["panels"] = []
+    ExplorerWindow(root, settings, initial_select=start_file)
     if not HAS_DND:
         root.after(500, lambda: messagebox.showinfo(
             "Drag & Drop",
